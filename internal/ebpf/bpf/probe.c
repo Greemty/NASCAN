@@ -1,10 +1,11 @@
 // +build ignore
 
-#include <vmlinux.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 
+#define AF_INET 2
 // Types d'événements
 #define EVENT_TCP_CONNECT 1
 #define EVENT_EXECVE      2
