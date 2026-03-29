@@ -13,6 +13,7 @@ import (
 	"github.com/greemty/nascan/internal/quarantine"
 	"github.com/greemty/nascan/internal/rules"
 	"github.com/greemty/nascan/internal/scanner"
+	"github.com/greemty/nascan/internal/threatintel"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
@@ -35,6 +36,7 @@ func main() {
 	forceUpdate := fs.Bool("force-update", false, "Re-download rules even if already present")
 	scanExisting := fs.Bool("scan-existing", false, "Scanner les fichiers déjà présents au démarrage")
 	quarantineDir := fs.String("quarantine", "", "Dossier de quarantaine (vide = désactivé)")
+
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		fs.PrintDefaults()
@@ -91,6 +93,12 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 		return fmt.Errorf("ensuring rules: %w", err)
 	}
 
+	// Threat intel — liste d'IPs C2 connues (Feodo Tracker)
+	feed := threatintel.NewFeed(logger)
+	if err := feed.Start(ctx); err != nil {
+		return fmt.Errorf("threat intel: %w", err)
+	}
+
 	// Prometheus
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -108,10 +116,10 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 	// eBPF
 	netEvents := make(chan ebpf.NetworkEvent, 256)
 	execEvents := make(chan ebpf.ExecEvent, 256)
-	correlator := ebpf.NewCorrelator(logger)
+	correlator := ebpf.NewCorrelator(logger, feed)
 	probe := ebpf.NewProbe(netEvents, execEvents, logger)
 
-	// Consommateur d'alertes YARA — unique, passe au correlator
+	// Quarantaine
 	var q *quarantine.Quarantine
 	if cfg.quarantineDir != "" {
 		q, err = quarantine.New(cfg.quarantineDir, logger)
@@ -120,6 +128,7 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 		}
 	}
 
+	// Consommateur d'alertes YARA — unique
 	go func() {
 		for alert := range alerts {
 			logger.Warn("alerte",

@@ -5,18 +5,17 @@ import (
 	"time"
 
 	"github.com/greemty/nascan/internal/scanner"
+	"github.com/greemty/nascan/internal/threatintel"
 	"go.uber.org/zap"
 )
 
 const correlationWindow = 60 * time.Second
 
-// Correlator fait le lien entre les alertes YARA et les events réseau eBPF
-// Si un fichier est détecté par YARA et qu'une connexion sortante apparaît
-// dans la fenêtre de corrélation, on lève une alerte enrichie.
 type Correlator struct {
 	mu     sync.Mutex
 	alerts []timedAlert
 	logger *zap.Logger
+	feed   *threatintel.Feed
 }
 
 type timedAlert struct {
@@ -24,8 +23,8 @@ type timedAlert struct {
 	at    time.Time
 }
 
-func NewCorrelator(logger *zap.Logger) *Correlator {
-	return &Correlator{logger: logger}
+func NewCorrelator(logger *zap.Logger, feed *threatintel.Feed) *Correlator {
+	return &Correlator{logger: logger, feed: feed}
 }
 
 // AddAlert enregistre une alerte YARA pour corrélation future
@@ -36,26 +35,46 @@ func (c *Correlator) AddAlert(alert scanner.Alert) {
 	c.gc()
 }
 
-// OnNetworkEvent vérifie si une connexion sortante correspond à une alerte YARA récente
+// OnNetworkEvent vérifie si une connexion sortante est suspecte
 func (c *Correlator) OnNetworkEvent(ev NetworkEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gc()
 
-	if len(c.alerts) == 0 {
+	ip := ev.DAddr.String()
+	isMalicious := c.feed.IsMalicious(ip)
+
+	// Rien à signaler : pas d'alerte YARA active ET IP non malveillante
+	if len(c.alerts) == 0 && !isMalicious {
 		return
 	}
 
-	// Si des alertes YARA sont actives dans la fenêtre, on corrèle
+	// Connexion vers un C2 connu, même sans alerte YARA
+	if isMalicious && len(c.alerts) == 0 {
+		c.logger.Warn("connexion vers C2 connu",
+			zap.String("ip", ip),
+			zap.Uint16("port", ev.DPort),
+			zap.String("comm", ev.Comm),
+			zap.Uint32("pid", ev.PID),
+		)
+		return
+	}
+
+	// Corrélation YARA + réseau
 	for _, a := range c.alerts {
-		c.logger.Warn("corrélation YARA ↔ réseau",
+		fields := []zap.Field{
 			zap.String("yara_file", a.alert.Path),
 			zap.String("yara_rule", a.alert.RuleName),
 			zap.String("net_comm", ev.Comm),
 			zap.Uint32("net_pid", ev.PID),
-			zap.String("dst", ev.DAddr.String()),
+			zap.String("dst", ip),
 			zap.Uint16("dport", ev.DPort),
-		)
+		}
+		if isMalicious {
+			c.logger.Warn("corrélation YARA ↔ C2 confirmé", fields...)
+		} else {
+			c.logger.Warn("corrélation YARA ↔ réseau", fields...)
+		}
 	}
 }
 
