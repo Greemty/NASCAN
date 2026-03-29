@@ -2,10 +2,11 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
-	"fmt"
+
 	"github.com/fsnotify/fsnotify"
 	yara "github.com/hillu/go-yara/v4"
 	"github.com/prometheus/client_golang/prometheus"
@@ -129,7 +130,7 @@ func (s *Scanner) handleEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 			return
 		}
 	}
-	if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) {
+	if event.Has(fsnotify.Create) {
 		go s.scanFile(event.Name)
 	}
 }

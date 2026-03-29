@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"go.uber.org/zap"
+
+	"github.com/greemty/nascan/internal/ebpf"
+	"github.com/greemty/nascan/internal/metrics"
 	"github.com/greemty/nascan/internal/rules"
 	"github.com/greemty/nascan/internal/scanner"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 const usage = `nascan - NAS security scanner
@@ -24,8 +27,8 @@ Flags:
 
 func main() {
 	fs := flag.NewFlagSet("nascan", flag.ExitOnError)
-	watchPath   := fs.String("watch", "/mnt/nas", "Path to watch (e.g. NFS mount point)")
-	bundle   := fs.String("bundle", "core", "YARA-Forge bundle: core | extended | full")
+	watchPath := fs.String("watch", "/mnt/nas", "Path to watch (e.g. NFS mount point)")
+	bundle := fs.String("bundle", "core", "YARA-Forge bundle: core | extended | full")
 	rulesDir := fs.String("rules-dir", "./rules-data", "Directory where YARA rules are stored")
 	metricsAddr := fs.String("metrics", ":9100", "Prometheus metrics endpoint (empty to disable)")
 	forceUpdate := fs.Bool("force-update", false, "Re-download rules even if already present")
@@ -36,7 +39,6 @@ func main() {
 		fs.PrintDefaults()
 	}
 
-	// Subcommand: update-rules
 	if len(os.Args) > 1 && os.Args[1] == "update-rules" {
 		runUpdateRules(*rulesDir, *bundle)
 		return
@@ -53,11 +55,11 @@ func main() {
 	defer cancel()
 
 	if err := run(ctx, logger, &config{
-		watchPath:   *watchPath,
-		rulesDir:    *rulesDir,
-		bundle:      *bundle,
-		metricsAddr: *metricsAddr,
-		forceUpdate: *forceUpdate,
+		watchPath:    *watchPath,
+		rulesDir:     *rulesDir,
+		bundle:       *bundle,
+		metricsAddr:  *metricsAddr,
+		forceUpdate:  *forceUpdate,
 		scanExisting: *scanExisting,
 	}); err != nil {
 		logger.Fatal("fatal error", zap.Error(err))
@@ -65,39 +67,48 @@ func main() {
 }
 
 type config struct {
-	watchPath   string
-	rulesDir    string
-	bundle      string
-	metricsAddr string
-	forceUpdate bool
+	watchPath    string
+	rulesDir     string
+	bundle       string
+	metricsAddr  string
+	forceUpdate  bool
 	scanExisting bool
 }
 
 func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
-    logger.Info("nascan starting",
-        zap.String("watch", cfg.watchPath),
-        zap.String("bundle", cfg.bundle),
-        zap.String("metrics", cfg.metricsAddr),
-    )
+	logger.Info("nascan starting",
+		zap.String("watch", cfg.watchPath),
+		zap.String("bundle", cfg.bundle),
+		zap.String("metrics", cfg.metricsAddr),
+	)
 
-    updater := rules.NewUpdater(cfg.rulesDir, cfg.bundle, logger)
-    if err := updater.EnsureRules(ctx, cfg.forceUpdate); err != nil {
-        return fmt.Errorf("ensuring rules: %w", err)
-    }
+	// Rules
+	updater := rules.NewUpdater(cfg.rulesDir, cfg.bundle, logger)
+	if err := updater.EnsureRules(ctx, cfg.forceUpdate); err != nil {
+		return fmt.Errorf("ensuring rules: %w", err)
+	}
 
-    // TODO: scanner
+	// Prometheus
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	// Alertes
-	alerts := make(chan scanner.Alert, 256)
+	reg.MustRegister(
+		prometheus.NewGoCollector(),
+		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+	)
 
 	// Scanner
+	alerts := make(chan scanner.Alert, 256)
 	sc, err := scanner.New(cfg.watchPath, updater.RulesPath(), alerts, logger, reg)
 	if err != nil {
 		return fmt.Errorf("init scanner: %w", err)
 	}
 
-	// Consommateur d'alertes (pour l'instant on log, eBPF viendra ici)
+	// eBPF
+	netEvents := make(chan ebpf.NetworkEvent, 256)
+	execEvents := make(chan ebpf.ExecEvent, 256)
+	correlator := ebpf.NewCorrelator(logger)
+	probe := ebpf.NewProbe(netEvents, execEvents, logger)
+
+	// Consommateur d'alertes YARA — unique, passe au correlator
 	go func() {
 		for alert := range alerts {
 			logger.Warn("alerte",
@@ -105,9 +116,18 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 				zap.String("rule", alert.RuleName),
 				zap.Strings("tags", alert.Tags),
 			)
+			correlator.AddAlert(alert)
 		}
 	}()
 
+	// Correlator écoute les events réseau eBPF
+	go func() {
+		for ev := range netEvents {
+			correlator.OnNetworkEvent(ev)
+		}
+	}()
+
+	// Scanner (scan existants puis watch)
 	go func() {
 		if cfg.scanExisting {
 			if err := sc.ScanExisting(ctx); err != nil {
@@ -118,20 +138,34 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 			logger.Error("scanner error", zap.Error(err))
 		}
 	}()
-    // TODO: metrics server
-    // TODO: eBPF probe
 
-    <-ctx.Done()
-    logger.Info("nascan stopped")
-    return nil
+	// Probe eBPF
+	go func() {
+		if err := probe.Run(ctx); err != nil {
+			logger.Error("eBPF probe error", zap.Error(err))
+		}
+	}()
+
+	// Metrics server
+	if cfg.metricsAddr != "" {
+		go func() {
+			if err := metrics.Serve(ctx, cfg.metricsAddr, reg, logger); err != nil {
+				logger.Error("metrics server error", zap.Error(err))
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	logger.Info("nascan stopped")
+	return nil
 }
 
 func runUpdateRules(rulesDir, bundle string) {
-    logger, _ := zap.NewProduction()
-    defer logger.Sync()
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
 
-    updater := rules.NewUpdater(rulesDir, bundle, logger)
-    if err := updater.EnsureRules(context.Background(), true); err != nil {
-        logger.Fatal("update-rules failed", zap.Error(err))
-    }
+	updater := rules.NewUpdater(rulesDir, bundle, logger)
+	if err := updater.EnsureRules(context.Background(), true); err != nil {
+		logger.Fatal("update-rules failed", zap.Error(err))
+	}
 }

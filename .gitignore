@@ -1,3 +1,4 @@
 *.tmp
 /rules-data/*.yar
 .DS_Store
+/nascan
