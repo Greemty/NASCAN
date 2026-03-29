@@ -148,3 +148,9 @@ func (f *Feed) fetchSource(ctx context.Context, url, comment string, dest map[st
 
 	return count, sc.Err()
 }
+
+func (f *Feed) AddIP(ip string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ips[ip] = struct{}{}
+}
