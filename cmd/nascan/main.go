@@ -116,13 +116,13 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 	// eBPF
 	netEvents := make(chan ebpf.NetworkEvent, 256)
 	execEvents := make(chan ebpf.ExecEvent, 256)
-	correlator := ebpf.NewCorrelator(logger, feed)
+	correlator := ebpf.NewCorrelator(logger, feed, reg)
 	probe := ebpf.NewProbe(netEvents, execEvents, logger)
 
 	// Quarantaine
 	var q *quarantine.Quarantine
 	if cfg.quarantineDir != "" {
-		q, err = quarantine.New(cfg.quarantineDir, logger)
+		q, err = quarantine.New(cfg.quarantineDir, logger, reg)
 		if err != nil {
 			return fmt.Errorf("init quarantine: %w", err)
 		}

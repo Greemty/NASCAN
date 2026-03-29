@@ -6,6 +6,7 @@ import (
 
 	"github.com/greemty/nascan/internal/scanner"
 	"github.com/greemty/nascan/internal/threatintel"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -16,6 +17,9 @@ type Correlator struct {
 	alerts []timedAlert
 	logger *zap.Logger
 	feed   *threatintel.Feed
+
+	c2Connections prometheus.Counter
+	correlations  *prometheus.CounterVec
 }
 
 type timedAlert struct {
@@ -23,19 +27,34 @@ type timedAlert struct {
 	at    time.Time
 }
 
-func NewCorrelator(logger *zap.Logger, feed *threatintel.Feed) *Correlator {
-	return &Correlator{logger: logger, feed: feed}
+func NewCorrelator(logger *zap.Logger, feed *threatintel.Feed, reg prometheus.Registerer) *Correlator {
+	c2Connections := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "nascan_c2_connections_total",
+		Help: "Connexions vers des IPs C2 connues",
+	})
+	correlations := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nascan_correlations_total",
+		Help: "Corrélations YARA ↔ réseau par type",
+	}, []string{"type"}) // type: yara_only | c2_only | yara_c2
+
+	reg.MustRegister(c2Connections, correlations)
+
+	return &Correlator{
+		logger:        logger,
+		feed:          feed,
+		c2Connections: c2Connections,
+		correlations:  correlations,
+	}
 }
 
-// AddAlert enregistre une alerte YARA pour corrélation future
 func (c *Correlator) AddAlert(alert scanner.Alert) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.alerts = append(c.alerts, timedAlert{alert: alert, at: time.Now()})
+	c.correlations.WithLabelValues("yara_only").Inc()
 	c.gc()
 }
 
-// OnNetworkEvent vérifie si une connexion sortante est suspecte
 func (c *Correlator) OnNetworkEvent(ev NetworkEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -44,13 +63,13 @@ func (c *Correlator) OnNetworkEvent(ev NetworkEvent) {
 	ip := ev.DAddr.String()
 	isMalicious := c.feed.IsMalicious(ip)
 
-	// Rien à signaler : pas d'alerte YARA active ET IP non malveillante
 	if len(c.alerts) == 0 && !isMalicious {
 		return
 	}
 
-	// Connexion vers un C2 connu, même sans alerte YARA
 	if isMalicious && len(c.alerts) == 0 {
+		c.c2Connections.Inc()
+		c.correlations.WithLabelValues("c2_only").Inc()
 		c.logger.Warn("connexion vers C2 connu",
 			zap.String("ip", ip),
 			zap.Uint16("port", ev.DPort),
@@ -60,7 +79,6 @@ func (c *Correlator) OnNetworkEvent(ev NetworkEvent) {
 		return
 	}
 
-	// Corrélation YARA + réseau
 	for _, a := range c.alerts {
 		fields := []zap.Field{
 			zap.String("yara_file", a.alert.Path),
@@ -71,14 +89,16 @@ func (c *Correlator) OnNetworkEvent(ev NetworkEvent) {
 			zap.Uint16("dport", ev.DPort),
 		}
 		if isMalicious {
+			c.c2Connections.Inc()
+			c.correlations.WithLabelValues("yara_c2").Inc()
 			c.logger.Warn("corrélation YARA ↔ C2 confirmé", fields...)
 		} else {
+			c.correlations.WithLabelValues("yara_only").Inc()
 			c.logger.Warn("corrélation YARA ↔ réseau", fields...)
 		}
 	}
 }
 
-// gc supprime les alertes hors de la fenêtre de corrélation
 func (c *Correlator) gc() {
 	cutoff := time.Now().Add(-correlationWindow)
 	fresh := c.alerts[:0]

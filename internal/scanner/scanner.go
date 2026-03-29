@@ -13,7 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Alert représente un match YARA sur un fichier
 type Alert struct {
 	Path      string
 	RuleName  string
@@ -22,7 +21,6 @@ type Alert struct {
 	Timestamp time.Time
 }
 
-// Scanner surveille un répertoire et scanne les fichiers avec YARA
 type Scanner struct {
 	watchPath string
 	rules     *yara.Rules
@@ -46,8 +44,8 @@ func New(watchPath, rulesPath string, alerts chan<- Alert, logger *zap.Logger, r
 	})
 	yaraHits := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nascan_yara_hits_total",
-		Help: "Nombre de matches YARA par règle",
-	}, []string{"rule"})
+		Help: "Nombre de matches YARA par règle et namespace",
+	}, []string{"rule", "namespace"})
 	scanDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "nascan_scan_duration_seconds",
 		Help:    "Durée de scan d'un fichier",
@@ -67,30 +65,6 @@ func New(watchPath, rulesPath string, alerts chan<- Alert, logger *zap.Logger, r
 	}, nil
 }
 
-// ScanExisting scanne tous les fichiers déjà présents dans watchPath
-func (s *Scanner) ScanExisting(ctx context.Context) error {
-	s.logger.Info("scan des fichiers existants", zap.String("path", s.watchPath))
-
-	return filepath.WalkDir(s.watchPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			s.logger.Warn("erreur walk", zap.String("path", path), zap.Error(err))
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		// Respect du ctx pour pouvoir interrompre avec Ctrl+C
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("scan interrompu")
-		default:
-			go s.scanFile(path)
-		}
-		return nil
-	})
-}
-
-// Run démarre la surveillance inotify. Bloque jusqu'à ce que ctx soit annulé.
 func (s *Scanner) Run(ctx context.Context) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -120,6 +94,27 @@ func (s *Scanner) Run(ctx context.Context) error {
 			s.logger.Warn("erreur watcher", zap.Error(err))
 		}
 	}
+}
+
+func (s *Scanner) ScanExisting(ctx context.Context) error {
+	s.logger.Info("scan des fichiers existants", zap.String("path", s.watchPath))
+
+	return filepath.WalkDir(s.watchPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			s.logger.Warn("erreur walk", zap.String("path", path), zap.Error(err))
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("scan interrompu")
+		default:
+			go s.scanFile(path)
+		}
+		return nil
+	})
 }
 
 func (s *Scanner) handleEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
@@ -155,7 +150,7 @@ func (s *Scanner) scanFile(path string) {
 			zap.String("namespace", m.Namespace),
 			zap.Strings("tags", m.Tags),
 		)
-		s.yaraHits.WithLabelValues(m.Rule).Inc()
+		s.yaraHits.WithLabelValues(m.Rule, m.Namespace).Inc()
 		s.alerts <- Alert{
 			Path:      path,
 			RuleName:  m.Rule,
