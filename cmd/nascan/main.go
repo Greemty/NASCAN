@@ -10,6 +10,7 @@ import (
 
 	"github.com/greemty/nascan/internal/ebpf"
 	"github.com/greemty/nascan/internal/metrics"
+	"github.com/greemty/nascan/internal/quarantine"
 	"github.com/greemty/nascan/internal/rules"
 	"github.com/greemty/nascan/internal/scanner"
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,7 +34,7 @@ func main() {
 	metricsAddr := fs.String("metrics", ":9100", "Prometheus metrics endpoint (empty to disable)")
 	forceUpdate := fs.Bool("force-update", false, "Re-download rules even if already present")
 	scanExisting := fs.Bool("scan-existing", false, "Scanner les fichiers déjà présents au démarrage")
-
+	quarantineDir := fs.String("quarantine", "", "Dossier de quarantaine (vide = désactivé)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 		fs.PrintDefaults()
@@ -55,24 +56,26 @@ func main() {
 	defer cancel()
 
 	if err := run(ctx, logger, &config{
-		watchPath:    *watchPath,
-		rulesDir:     *rulesDir,
-		bundle:       *bundle,
-		metricsAddr:  *metricsAddr,
-		forceUpdate:  *forceUpdate,
-		scanExisting: *scanExisting,
+		watchPath:     *watchPath,
+		rulesDir:      *rulesDir,
+		bundle:        *bundle,
+		metricsAddr:   *metricsAddr,
+		forceUpdate:   *forceUpdate,
+		scanExisting:  *scanExisting,
+		quarantineDir: *quarantineDir,
 	}); err != nil {
 		logger.Fatal("fatal error", zap.Error(err))
 	}
 }
 
 type config struct {
-	watchPath    string
-	rulesDir     string
-	bundle       string
-	metricsAddr  string
-	forceUpdate  bool
-	scanExisting bool
+	watchPath     string
+	rulesDir      string
+	bundle        string
+	metricsAddr   string
+	forceUpdate   bool
+	scanExisting  bool
+	quarantineDir string
 }
 
 func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
@@ -109,6 +112,14 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 	probe := ebpf.NewProbe(netEvents, execEvents, logger)
 
 	// Consommateur d'alertes YARA — unique, passe au correlator
+	var q *quarantine.Quarantine
+	if cfg.quarantineDir != "" {
+		q, err = quarantine.New(cfg.quarantineDir, logger)
+		if err != nil {
+			return fmt.Errorf("init quarantine: %w", err)
+		}
+	}
+
 	go func() {
 		for alert := range alerts {
 			logger.Warn("alerte",
@@ -117,6 +128,12 @@ func run(ctx context.Context, logger *zap.Logger, cfg *config) error {
 				zap.Strings("tags", alert.Tags),
 			)
 			correlator.AddAlert(alert)
+
+			if q != nil {
+				if err := q.Move(alert); err != nil {
+					logger.Error("quarantine failed", zap.String("file", alert.Path), zap.Error(err))
+				}
+			}
 		}
 	}()
 
